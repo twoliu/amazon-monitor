@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Amazon 链接监控 · MVP</title>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;background:#f4f6f8;color:#1a1a2e}
+  header{padding:16px 24px;background:#1a1a2e;color:#fff;display:flex;align-items:center;gap:16px}
+  header h1{font-size:18px;margin:0}
+  .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+  .toolbar{display:flex;gap:12px;margin-bottom:16px;align-items:center;flex-wrap:wrap}
+  button{background:#2563eb;color:#fff;border:0;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:14px}
+  button:hover{opacity:.9}
+  input{padding:8px;border:1px solid #ccc;border-radius:6px;min-width:220px}
+  textarea{font-family:monospace;font-size:12px;box-sizing:border-box}
+  .card{background:#fff;border-radius:10px;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.08);cursor:pointer}
+  .top{display:flex;justify-content:space-between;align-items:center;gap:16px}
+  .badge{font-size:12px;padding:3px 8px;border-radius:10px;white-space:nowrap}
+  .b-p0{background:#fee2e2;color:#b91c1c}
+  .b-p1{background:#ffedd5;color:#c2410c}
+  .b-ok{background:#dcfce7;color:#15803d}
+  .price{font-size:20px;font-weight:700}
+  .meta{color:#666;font-size:13px;margin-top:6px;word-break:break-all}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #eee;vertical-align:top}
+  .alerts{background:#fff7ed;border-left:4px solid #f97316;padding:8px 12px;margin-top:8px;border-radius:4px;white-space:pre-wrap;font-size:13px}
+  .title{font-size:14px;font-weight:600;margin-bottom:4px}
+  .detail{display:none;margin-top:12px}
+  .open .detail{display:block}
+  code{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
+  .import-box{display:none;background:#fff;border-radius:10px;padding:14px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+</style>
+</head>
+<body>
+<header>
+  <h1>🛰 Amazon 链接监控 · MVP</h1>
+  <span id="mode" style="font-size:12px;opacity:.8"></span>
+</header>
+<div class="wrap">
+  <div class="toolbar">
+    <button onclick="runMonitor()">⚡ 立即巡检一轮</button>
+    <input id="newAsin" placeholder="输入 ASIN 添加监控 (如 B0FYP2YXZF)">
+    <button onclick="addLink()">添加</button>
+    <button onclick="showImport()" style="background:#059669">📥 导入快照 JSON</button>
+    <span id="status" style="color:#666;font-size:13px"></span>
+  </div>
+
+  <div class="import-box" id="importBox">
+    <textarea id="importJson" rows="8" style="width:100%"
+      placeholder='{"snapshots":[{"asin":"B0FYP2YXZF","title":"...","price":341.99,"buyboxSeller":"Amazon","sellers":1,"rating":4.7,"ratings":32}]}'></textarea>
+    <div style="margin-top:8px;display:flex;gap:8px">
+      <button onclick="doImport()" style="background:#059669">导入并巡检</button>
+      <button onclick="document.getElementById('importBox').style.display='none'" style="background:#64748b">关闭</button>
+    </div>
+  </div>
+
+  <div id="list"></div>
+</div>
+
+<script>
+async function j(url, opt){
+  const r = await fetch(url, opt);
+  return r.json();
+}
+async function refresh(){
+  const cfg = await j('/api/config');
+  document.getElementById('mode').textContent =
+    '模式: ' + cfg.data_source + ' · 字段: 标题/价格/购物车/评分/评论数 · 评论按单ASIN不含变体';
+  const links = await j('/api/links');
+  const box = document.getElementById('list');
+  if(!links.length){ box.innerHTML = '<p style="color:#888">暂无监控链接，输入 ASIN 添加，或导入快照 JSON</p>'; return; }
+  box.innerHTML = links.map(l => {
+    const sev = l.unread_alerts > 0 ? (l.unread_alerts > 2 ? 'p0' : 'p1') : 'ok';
+    const badgeText = sev === 'ok' ? '正常' : (l.unread_alerts + ' 条告警');
+    return `<div class="card" data-asin="${l.asin}" onclick="toggle(this)">
+      <div class="top">
+        <div style="min-width:0">
+          <div class="title">${esc(l.title || '(暂无快照)')} ${l.note ? `<code>${esc(l.note)}</code>` : ''}</div>
+          <div class="meta">ASIN: ${l.asin} · Buy Box: ${esc(l.buybox_seller || '-')} (卖家${l.sellers_count ?? '-'}家)
+                · 评分 ${l.rating ?? '-'} · 评论 ${l.review_count ?? '-'} · 巡检于 ${l.fetched_at || '-'}
+                ${l.url ? ` · <a href="${esc(l.url)}" target="_blank" style="color:#2563eb">查看原链接</a>` : ''}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="price">$${l.price != null ? Number(l.price).toFixed(2) : '-'}</div>
+          <span class="badge b-${sev}">${badgeText}</span>
+        </div>
+      </div>
+      <div class="detail"></div>
+    </div>`;
+  }).join('');
+}
+function toggle(card){
+  card.classList.toggle('open');
+  if(!card.querySelector('.detail').innerHTML) loadHistory(card);
+}
+async function loadHistory(card){
+  const asin = card.dataset.asin;
+  const d = await j('/api/links/' + asin + '/history');
+  let html = '<table><tr><th>时间</th><th>价格</th><th>Buy Box</th><th>卖家数</th><th>评分</th><th>评论数</th><th>标题</th></tr>';
+  d.snapshots.forEach(s => {
+    html += `<tr><td>${s.fetched_at}</td><td>$${s.price != null ? Number(s.price).toFixed(2) : '-'}</td>
+      <td>${esc(s.buybox_seller || '-')}</td><td>${s.sellers_count ?? '-'}</td><td>${s.rating ?? '-'}</td>
+      <td>${s.review_count ?? '-'}</td><td style="font-size:12px">${esc((s.title || '').slice(0, 40))}</td></tr>`;
+  });
+  html += '</table>';
+  if(d.alerts.length){
+    html += '<h4 style="margin:12px 0 4px">告警记录</h4>';
+    d.alerts.forEach(a => {
+      html += `<div class="alerts">[${esc(a.severity)}] ${a.created_at} ${esc(a.message)}</div>`;
+    });
+  } else {
+    html += '<p style="color:#888">暂无告警（对比产生差异时才会出现）</p>';
+  }
+  card.querySelector('.detail').innerHTML = html;
+}
+function showImport(){ document.getElementById('importBox').style.display = 'block'; }
+async function doImport(){
+  const st = document.getElementById('status');
+  st.textContent = '导入中…';
+  let body;
+  try { body = JSON.parse(document.getElementById('importJson').value); }
+  catch(e){ st.textContent = 'JSON 解析失败：' + e.message; return; }
+  const r = await j('/api/import', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const nAlert = r.results.reduce((s, x) => s + (x.alerts ? x.alerts.length : 0), 0);
+  st.textContent = `导入 ${r.count} 条 · 新告警 ${nAlert} 条 · 点卡片展开看详情`;
+  refresh();
+}
+async function runMonitor(){
+  const st = document.getElementById('status');
+  st.textContent = '巡检中…';
+  const r = await j('/api/monitor/run', {method: 'POST'});
+  const nAlert = r.results.reduce((s, x) => s + (x.alerts ? x.alerts.length : 0), 0);
+  if(r.count === 0){
+    st.textContent = '当前为 import 模式或暂无待巡检链接：请用 📥 导入快照 JSON';
+  } else {
+    st.textContent = `巡检完成 ${r.count} 条 · 新告警 ${nAlert} 条`;
+  }
+  refresh();
+}
+async function addLink(){
+  const v = document.getElementById('newAsin').value.trim().toUpperCase();
+  if(!v) return;
+  await j('/api/links/' + encodeURIComponent(v), {method: 'POST'});
+  document.getElementById('newAsin').value = '';
+  refresh();
+}
+function esc(s){
+  return (s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>
